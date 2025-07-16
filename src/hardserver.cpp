@@ -1,5 +1,6 @@
 #include "hardserver.h"
 #include "logger.h"
+#include <ESP8266WiFi.h>
 
 HardServer::HardServer(uint16_t port) : server(port) {}
 
@@ -7,12 +8,13 @@ HardServer::HardServer(uint16_t port) : server(port) {}
 void HardServer::begin()
 {
   // Route Setup: This sets up the main route ("/") of the web server to handle HTTP GET requests.
-  // Why? The lambda function is used here to capture the 'this' pointer, allowing access to class members (like username and hashedPassword).
+  // Why? The lambda function is used here to capture the 'this' pointer, allowing access to class members (like username and plaintextPassword).
   // Decision: Basic HTTP authentication is used here because it is simple to implement and sufficient for low-stakes IoT applications.
   // Alternatives like OAuth or JWT were not chosen due to their complexity and the limited processing power of the ESP8266.
+  // FIXED: Now using plaintextPassword instead of hashedPassword for HTTP Basic Auth to work correctly
   server.on("/", HTTP_GET, [this](AsyncWebServerRequest *request)
             {
-        if (!request->authenticate(username.c_str(), hashedPassword.c_str())) {
+        if (!request->authenticate(username.c_str(), plaintextPassword.c_str())) {
             return request->requestAuthentication();
         }
         request->send(200, "text/html", "Welcome to the secure server!"); });
@@ -30,6 +32,9 @@ void HardServer::setupLoginPage(const char *user, const char *pass)
 {
   // Why? Storing the username as a String object makes it easy to compare with incoming HTTP requests.
   username = String(user);
+
+  // Store plaintext password for HTTP Basic Authentication
+  plaintextPassword = String(pass);
 
   // Why? Passwords are hashed before being stored to enhance security. If someone gains access to the memory, they won't see plain-text passwords.
   // Decision: SHA-1 was chosen because it's a straightforward hashing algorithm with sufficient speed and security for this context.

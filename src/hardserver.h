@@ -20,6 +20,7 @@ public:
 private:
   AsyncWebServer server; // The asynchronous web server object
   String hashedPassword; // Stores the hashed version of the password for comparison
+  String plaintextPassword; // Stores the plaintext password for HTTP Basic Auth
   String username;       // Stores the plaintext username
 
   // Handles the login request securely
