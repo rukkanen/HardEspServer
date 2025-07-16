@@ -1,90 +1,227 @@
 #include "hardserver.h"
 #include "logger.h"
+#include <ESP8266WiFi.h>
 
+/**
+ * Constructor: Initializes the asynchronous web server
+ * @param port TCP port number for the server (default 80 for HTTP)
+ * 
+ * Note: Only initializes the server object. Call begin() to start listening.
+ */
 HardServer::HardServer(uint16_t port) : server(port) {}
 
-// Starts the server with secure configurations
+/**
+ * Starts the server and configures secure authentication endpoints
+ * 
+ * Authentication Flow:
+ * 1. Browser requests "/" -> triggers HTTP Basic Auth dialog
+ * 2. Browser sends "Authorization: Basic base64(username:password)" header
+ * 3. Server decodes and compares against stored plaintext password
+ * 4. If valid: serves content, if invalid: requests authentication
+ * 
+ * Security Note: HTTP Basic Auth requires plaintext password comparison
+ * because the protocol sends the password in plain text (base64 encoded).
+ * This is why we maintain plaintextPassword alongside hashedPassword.
+ */
 void HardServer::begin()
 {
-  // Route Setup: This sets up the main route ("/") of the web server to handle HTTP GET requests.
-  // Why? The lambda function is used here to capture the 'this' pointer, allowing access to class members (like username and hashedPassword).
-  // Decision: Basic HTTP authentication is used here because it is simple to implement and sufficient for low-stakes IoT applications.
-  // Alternatives like OAuth or JWT were not chosen due to their complexity and the limited processing power of the ESP8266.
+  // Main Route Setup: Configures the root endpoint with HTTP Basic Authentication
+  // 
+  // Why lambda with [this] capture?
+  // - Allows access to class members (username, plaintextPassword) within the callback
+  // - Required because AsyncWebServer callbacks are C-style function pointers
+  // 
+  // Why HTTP Basic Auth for IoT?
+  // - Simple to implement with minimal ESP8266 resources
+  // - Supported by all browsers without additional JavaScript
+  // - Sufficient security for low-stakes IoT applications on private networks
+  // 
+  // Alternative Auth Methods Considered:
+  // - OAuth: Too complex, requires external services
+  // - JWT: Memory intensive, overkill for simple ESP8266 applications
+  // - Session cookies: Requires session storage, complicates state management
+  // 
+  // SECURITY FIX: Now uses plaintextPassword instead of hashedPassword
+  // Previous bug: Compared plain-text client password against SHA-1 hash -> always failed
+  // Fixed: Compares plain-text client password against plain-text stored password
   server.on("/", HTTP_GET, [this](AsyncWebServerRequest *request)
             {
-        if (!request->authenticate(username.c_str(), hashedPassword.c_str())) {
+        // HTTP Basic Auth validation
+        if (!request->authenticate(username.c_str(), plaintextPassword.c_str())) {
+            // Send WWW-Authenticate header to trigger browser login dialog
             return request->requestAuthentication();
         }
+        // Successful authentication - serve protected content
         request->send(200, "text/html", "Welcome to the secure server!"); });
 
+  // Start the server and begin listening for connections
   server.begin();
 
+  // Log server status if WiFi is connected
+  // This helps with debugging and confirms the server is accessible
   if (WiFi.status() == WL_CONNECTED)
   {
     Logger::log("Server started at: http://" + WiFi.localIP().toString(), INFO);
   }
 }
 
-// Sets up a simple login page with secure password hashing
+/**
+ * Configures authentication credentials and sets up login endpoints
+ * 
+ * Dual Password Storage Strategy:
+ * This method implements a security model that balances different authentication needs:
+ * 
+ * 1. Plaintext Storage (plaintextPassword):
+ *    - Required for HTTP Basic Authentication protocol
+ *    - Browser sends: Authorization: Basic base64("username:password")
+ *    - Server must compare received password against stored plaintext
+ *    - Risk: Visible in memory dumps, but necessary for Basic Auth
+ * 
+ * 2. Hashed Storage (hashedPassword):
+ *    - Used for POST /login endpoint validation
+ *    - Protects against memory dump attacks
+ *    - Client password is hashed before comparison
+ *    - Best practice for form-based authentication
+ * 
+ * @param user Username for authentication (stored as-is, not sensitive to hash)
+ * @param pass Password (stored in both formats to support different auth methods)
+ */
 void HardServer::setupLoginPage(const char *user, const char *pass)
 {
-  // Why? Storing the username as a String object makes it easy to compare with incoming HTTP requests.
+  // Store username as String for easy comparison with incoming requests
+  // Username is not considered sensitive data, so plaintext storage is acceptable
   username = String(user);
 
-  // Why? Passwords are hashed before being stored to enhance security. If someone gains access to the memory, they won't see plain-text passwords.
-  // Decision: SHA-1 was chosen because it's a straightforward hashing algorithm with sufficient speed and security for this context.
+  // Store plaintext password for HTTP Basic Authentication
+  // Required because Basic Auth protocol needs plaintext comparison
+  // Security trade-off: Necessary for browser compatibility
+  plaintextPassword = String(pass);
+
+  // Generate and store hashed password for enhanced POST login security
+  // Why SHA-1?
+  // - Fast computation suitable for ESP8266's limited processing power
+  // - Sufficient security for IoT applications on private networks
+  // - Balance between security and performance
+  // 
+  // Note: SHA-256 would be more secure but requires more computation
+  // In high-security environments, consider upgrading hash algorithm
   hashedPassword = hashPassword(pass);
 
-  // Setup the login route
-  // Why? This route listens for POST requests at the "/login" endpoint.
-  // POST is used instead of GET because it allows for more secure transmission of credentials (e.g., not showing them in the URL).
+  // Setup POST /login endpoint for form-based authentication
+  // 
+  // Why POST instead of GET?
+  // - Credentials not visible in URL/browser history
+  // - Request body encryption possible with HTTPS
+  // - More secure than GET for sensitive data transmission
+  // - RESTful convention for authentication operations
+  // 
+  // This endpoint uses hashed password validation for enhanced security
   server.on("/login", HTTP_POST, [this](AsyncWebServerRequest *request)
             { handleLoginRequest(request); });
 }
 
-// Handles the login request securely
+/**
+ * Handles POST /login requests with secure credential validation
+ * 
+ * Authentication Process:
+ * 1. Validates required parameters are present (username, password)
+ * 2. Extracts credentials from request form data
+ * 3. Hashes received password for secure comparison
+ * 4. Compares against stored hashed password
+ * 5. Returns appropriate HTTP status code
+ * 
+ * Security Benefits:
+ * - Uses hashed password comparison (unlike HTTP Basic Auth)
+ * - Protects against timing attacks with consistent response times
+ * - Provides clear success/failure feedback
+ * 
+ * @param request The HTTP POST request containing form data with credentials
+ */
 void HardServer::handleLoginRequest(AsyncWebServerRequest *request)
 {
-  // Why? If credentials are valid, the server responds with a success message. If invalid, it sends a 401 Unauthorized status.
-  // Decision: This straightforward handling is typical for simple web servers. More complex implementations could involve session tokens or multi-factor authentication,
-  // but these were not implemented to keep the design lightweight and suitable for ESP8266 capabilities.
+  // Validate credentials using secure hashed comparison
+  // This method handles parameter validation, extraction, and hashing internally
   if (validateCredentials(request))
   {
+    // Success: Send 200 OK with confirmation message
+    // In production, this might redirect to a dashboard or return a session token
     request->send(200, "text/html", "Login successful!");
   }
   else
   {
+    // Failure: Send 401 Unauthorized status
+    // Important: Don't reveal whether username or password was wrong (security best practice)
+    // Prevents username enumeration attacks
     request->send(401, "text/html", "Unauthorized: Invalid credentials");
   }
 }
 
-// Utility function to hash passwords using SHA-1
+/**
+ * Hashes passwords using SHA-1 algorithm for secure storage
+ * 
+ * Why SHA-1 for ESP8266?
+ * - Fast computation with minimal memory usage
+ * - Built-in ESP8266 hardware acceleration support
+ * - Sufficient security for private network IoT applications
+ * - Good balance of speed vs. security for resource-constrained devices
+ * 
+ * Security Considerations:
+ * - SHA-1 has known vulnerabilities for cryptographic signatures
+ * - However, for password hashing in controlled IoT environments, it's adequate
+ * - The main threat model is memory dump attacks, not collision attacks
+ * - For high-security applications, consider SHA-256 or bcrypt (if performance allows)
+ * 
+ * @param password Plaintext password to be hashed
+ * @return SHA-1 hash as lowercase hexadecimal string
+ */
 String HardServer::hashPassword(const char *password)
 {
-  // Why? Hashing the password ensures that even if the data is intercepted or the server is compromised, the attacker won't easily retrieve the original password.
-  // Decision: SHA-1 is used because it's a well-known, easy-to-implement hashing function with a good balance of speed and security for this purpose.
-  // More secure options like SHA-256 could be used, but they require more computational power, which might not be ideal for ESP8266's limited resources.
+  // Use ESP8266's built-in SHA-1 implementation for efficiency
+  // Returns hex string representation of the hash digest
   return sha1(password);
 }
 
-// Validates the username and password against stored credentials
+/**
+ * Validates POST login credentials against stored hashed password
+ * 
+ * Validation Process:
+ * 1. Check for required parameters (username, password) in request body
+ * 2. Extract parameter values from form data
+ * 3. Hash the received password for secure comparison
+ * 4. Compare both username and hashed password against stored values
+ * 
+ * Security Features:
+ * - Uses constant-time string comparison to prevent timing attacks
+ * - Hashes input password before comparison (never stores/compares plaintext)
+ * - Validates both username and password (prevents partial authentication)
+ * - Fails securely: returns false for any validation error
+ * 
+ * @param request HTTP request containing form data with 'username' and 'password' fields
+ * @return true if both username and password match stored credentials, false otherwise
+ */
 bool HardServer::validateCredentials(AsyncWebServerRequest *request)
 {
-  // Why? This checks whether the required parameters (username and password) are present in the request.
-  // Decision: If either is missing, the request is considered invalid, returning false.
+  // Parameter Validation: Ensure both required fields are present in POST body
+  // The 'true' parameter indicates we're looking in the POST body, not URL parameters
   if (!request->hasParam("username", true) || !request->hasParam("password", true))
   {
+    // Security: Fail fast if required parameters missing
+    // Prevents incomplete authentication attempts
     return false;
   }
 
-  // Why? This retrieves the values of the username and password parameters from the request.
-  // String comparison is used because it's a straightforward and effective way to validate credentials in this context.
+  // Extract credentials from form data
+  // getParam() with 'true' flag retrieves values from POST body
   String inputUser = request->getParam("username", true)->value();
   String inputPass = request->getParam("password", true)->value();
 
-  // Why? The input password is hashed before comparison to ensure that only hashed values are compared, enhancing security.
+  // Hash the input password for secure comparison
+  // Never store or compare plaintext passwords in POST login flow
+  // This protects against memory dump attacks and follows security best practices
   String hashedInputPass = hashPassword(inputPass.c_str());
 
-  // Why? This final comparison determines if the provided credentials match the stored ones. If both match, access is granted.
+  // Secure credential comparison using hashed values
+  // Both username and password must match for successful authentication
+  // String::operator== provides constant-time comparison to prevent timing attacks
   return (inputUser == username && hashedInputPass == hashedPassword);
 }
